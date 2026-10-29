@@ -36,4 +36,33 @@ macOS. Fork: `nunez/PonyExl3`, base upstream `beamivalice/PonyExl3` @ `8e7fa6b`
 
 ### Qwen3.8-27B 4.00bpw smoke (container v1.4.2 canary)
 
-_(pending)_
+**Phase 0 GO.** Bundle: `models/Qwen3.8-27B-exl3-4.00bpw` (turboderp rev
+`4.00bpw`, 16 GB, 2 shards, qcfg `version: 1.4.2`, `codebook: mul1`,
+`mtp_bits: 4`, 707 `tensor_storage` entries, `model_type: qwen3_5` VL-wrapped).
+
+- `ponyexl3-generate --mtp off`: load **7.2 s**, 129 exact EXL3 linears
+  (65 huge/GEMV), coherent greedy output. **14.2 tok/s** decode (58-token
+  prompt, 128 gen), prefill 30 tok/s (short-prompt, cold).
+- `--mtp auto`: bundled head auto-discovered (`[mtp] draft head loaded`),
+  verify-gated speculation active — 70/174 drafts accepted, 2.21 tok/cycle,
+  **16.7 tok/s**. (MTP win is modest here; draft acceptance on this prompt
+  class is 40% — revisit with `--dflash`-style block drafter later.)
+- Consistency vs README curve: sits between M3 Max (11.3) and M5 Max (16.6)
+  plain decode — plausible for M3 Ultra on their kernels.
+- **Conclusion:** PonyExl3 loads exl3 **v1.4.2 + mul1 + bundled MTP** natively,
+  no loader patches needed → Phase 3's v1.6.2 DS pack is on the table.
+
+### Phase 1 tooling dry-run: `tools/dev/bundle_layout.py` on Qwen3.8 canary
+
+- Shard-**header**-only audit tool (no weight materialization → seconds even
+  on the 43-shard DS pack). Dry-run on the canary:
+  - 401 EXL3 modules in `tensor_storage` (1 `lm_head` + 400 under
+    `model.language_model.*`); loader's "[load] 129 exact EXL3 linears" is
+    **post-sibling-fusion** tree count, and strict-load with zero
+    `skipped_unmapped` warnings proves all 401 map to slots.
+  - K histogram empty at trellis-`shape` level: turboderp's qcfg stores
+    trellis shapes per entry differently than assumed for K-histogram —
+    **fix `module_k()` when we first run it on the DS pack (Phase 1)**;
+    dims/divisibility/plain-inventory paths all work.
+  - Plain inventory: 2.42 GiB text (norms/embeds/etc) + 0.20 GiB `mtp.*` +
+    0.86 GiB `vision.*` — matches the expected VL-wrapper + MTP bundle shape.

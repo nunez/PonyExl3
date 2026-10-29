@@ -1,5 +1,8 @@
 # deepseek_v41 on PonyExl3 — development plan
 
+**Status: Phase 0 ✅ GO (2026-10-29)** — see
+[`dsv41_devlog.md`](dsv41_devlog.md) for measurements.
+
 **Goal:** run `deepseek_v41` (DeepSeek-V4.1-Flash-1017) EXL3 checkpoints
 text-only on Apple Silicon through `ponyexl3-generate`, starting from the
 ungated `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` pack.
