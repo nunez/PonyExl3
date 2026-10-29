@@ -131,3 +131,43 @@ macOS. Fork: `nunez/PonyExl3`, base upstream `beamivalice/PonyExl3` @ `8e7fa6b`
   full suite 290 passed / 32 skipped.
 - **Phase 1 exit criteria met** (47's header check auto-enables when it
   lands). Phase 2 (pure-MLX arch) unblocked.
+
+---
+
+## 2026-10-29 — Phase 2: pure-MLX deepseek_v41 arch + parity
+
+- New package `ponyexl3/arch/deepseek_v41/` (14 modules, ~2.1k lines):
+  name-for-name port of PipeNetwork/deepseek-v41-mlx (MIT; attributed per
+  file). Module tree == checkpoint tensor names (`layers.N.attn.wq_a`,
+  `ffn.experts.N.w1`, `embed/head`) → Phase 3 EXL3 swap is 1:1. Zero
+  mlx_lm-arch dependency (mlx-lm still lacks the arch, #1233).
+- Covers: YaRN rope (+inverse, adjacent-pair, tail-only), QAT fake-quant
+  triplets (fp8-e4m3/ue8m0 window KV @32, fp4-e2m1/e4m3 compressed KV @16,
+  fp4/ue8m0 indexer q/k @32 — bit-exact vs oracle incl. IEEE-bit scale
+  ceil and ties-to-even e2m1 grid), gather-based sparse attn (shared
+  MLA kv, attn sink in denominator only, -1e30 all-masked zero rows),
+  chunk-general softmax-gate compressor (ratio>1 pooled / ratio==1 plain),
+  2-level indexer (candidate blocks pinned newest, ReLU + weights_proj
+  collapse, top-512 sorted), mHC staggered Sinkhorn (comb on summed-axis
+  j), sqrtsoftplus gate (bias selects-not-scales, 1e-20 renorm, ×1.5),
+  clamped SwiGLU(10) MoE (SwitchGLU gather), Engram hasher (prime buckets,
+  odd multipliers, compressed map) + fp8 row-gather embedding, and the
+  staggered-hc CED-style block stack.
+- Cache classes: window ring (chrono read + wrapped write), compressed-KV
+  append buffers with consumer references, compressor partial-group state,
+  index-key cache, per-forward SharedState (kv/index/topk/candidates).
+- **Parity harness** `tests/test_dsv41_arch_parity.py`
+  (PONYEXL3_DSV41_MLX-gated, 10 tests): our random-init weights transplanted
+  into the oracle's identically-named tree; **identical logits (<5e-5) over
+  3-chunk prefill + 8 decode steps**; fakequant/rope/sinkhorn/candidate-
+  block/sparse-attn/engram-hash submodule parity exact; compressor
+  chunk-invariance; rope-inverse round-trip; gate-math invariants;
+  chunk-vs-single decode identity.
+- **Generate-loop integration**: `Model.hidden()` (mlx_lm-style inner path)
+  + `DeepseekV41ForPony` view (`.model`/`.lm_head`/`make_cache`);
+  `stream_generate` greedy on the tiny model == raw reference loop,
+  deterministic across runs. Note: no explicit encoder/decoder prefill
+  split exists in the reference — CED is fully expressed via
+  `compress_ratios`/`kv_source_layers`/`index_source_layers` + SharedState.
+- Suite: 300 passed / 32 skipped. Phase 2 exit met; Phase 3 (EXL3
+  integration) unblocked — mapping table is audit §5.

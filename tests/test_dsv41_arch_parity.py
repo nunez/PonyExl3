@@ -208,6 +208,37 @@ def test_engram_hasher_parity() -> None:
     assert a.max() < max(CFG["engram_num_embeddings"])
 
 
+def test_generate_loop_integration() -> None:
+    """Phase 2 exit: synthetic model runs greedy through ponyexl3.mlx.generate."""
+    from ponyexl3.arch.deepseek_v41.pony import DeepseekV41ForPony
+    from ponyexl3.mlx.generate import GenStats, stream_generate
+
+    mx.random.seed(2)
+    m = our_model.Model(our_config.ModelArgs(**CFG), token_map=list(TOKEN_MAP))
+    wrapped = DeepseekV41ForPony(m)
+    rng = np.random.default_rng(31)
+    prompt = rng.integers(0, VOCAB, 24).tolist()
+
+    stats = GenStats()
+    out = list(stream_generate(wrapped, prompt, max_tokens=12, temp=0.0,
+                               prefill_chunk=10, stats=stats))
+    assert len(out) == 12
+    assert stats.prompt_tokens == 24 and stats.finish_reason == "length"
+    # greedy determinism: rerun matches
+    assert list(stream_generate(wrapped, prompt, max_tokens=12, temp=0.0,
+                                prefill_chunk=10)) == out
+    # identical to the raw reference-style loop (single-shot prefill, full logits)
+    cache = m.make_cache(bsz=1, max_seq_len=MAXSEQ + 16)
+    ids = mx.array([prompt])
+    expect: list[int] = []
+    logits = m(ids, cache)
+    for _ in range(12):
+        nxt = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+        expect.append(nxt)
+        logits = m(mx.array([[nxt]]), cache, last_logit_only=True)
+    assert out == expect
+
+
 def test_compressor_chunk_invariance() -> None:
     """Ratio-2 compressor: token-at-a-time decode == one 8-token prefill."""
     from ponyexl3.arch.deepseek_v41.compressor import Compressor, CompressorState

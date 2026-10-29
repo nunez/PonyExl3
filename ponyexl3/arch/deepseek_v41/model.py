@@ -118,9 +118,11 @@ class Model(nn.Module):
                    dtype=mx.float32) -> ModelCache:
         return ModelCache(self.args, bsz, max_seq_len, dtype)
 
-    def __call__(self, input_ids: mx.array, cache: ModelCache,
-                 last_logit_only: bool = False) -> mx.array:
-        """input_ids [b, n] continue the sequence at cache.offset. Advances the cache."""
+    def hidden(self, input_ids: mx.array, cache: ModelCache) -> mx.array:
+        """embed → blocks → final collapse + norm. Returns normalized hidden
+        [b, n, dim] for all positions; advances cache.offset. This is the
+        mlx_lm-style 'inner model' entry point ponyexl3.mlx.generate drives;
+        __call__ is the reference-parity path (adds the head)."""
         start_pos = cache.offset
         b, n = input_ids.shape
 
@@ -155,11 +157,16 @@ class Model(nn.Module):
 
         h = hc_pre(h, pre_mix)                       # collapse with the last ffn_pre
         h = self.norm(h)
+        cache.offset = start_pos + n
+        return h
+
+    def __call__(self, input_ids: mx.array, cache: ModelCache,
+                 last_logit_only: bool = False) -> mx.array:
+        """input_ids [b, n] continue the sequence at cache.offset. Advances the cache."""
+        h = self.hidden(input_ids, cache)
         if last_logit_only:
             h = h[:, -1:]
-        logits = self.head(h.astype(mx.float32))   # fp32 logits, as the reference
-        cache.offset = start_pos + n
-        return logits
+        return self.head(h.astype(mx.float32))     # fp32 logits, as the reference
 
 # Ported from PipeNetwork/deepseek-v41-mlx (MIT, (c) PipeNetwork contributors);
 # transcribed from the DeepSeek torch reference. Kept name-for-name so the
