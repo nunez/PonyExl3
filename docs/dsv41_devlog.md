@@ -66,3 +66,33 @@ macOS. Fork: `nunez/PonyExl3`, base upstream `beamivalice/PonyExl3` @ `8e7fa6b`
     dims/divisibility/plain-inventory paths all work.
   - Plain inventory: 2.42 GiB text (norms/embeds/etc) + 0.20 GiB `mtp.*` +
     0.86 GiB `vision.*` — matches the expected VL-wrapper + MTP bundle shape.
+
+---
+
+## 2026-10-29 — Phase 1 start: disk, tooling fixes, source-side audit
+
+- **Disk:** freed ~1.5 TB (retired `.mtplx`/`.omlx` runtimes, H3 BF16
+  weights, kapitsa/copilot caches) → 1.6 TB free on the 4 TB volume.
+  Downloads: LibertAI EXL3 pack (~205 GB) → `~/src/models/DeepSeek-V4.1-
+  Flash-1017-EXL3-2.9bpw`; DeepSeek shards 47/48 = Engram tables
+  (2 × 101.5 GB) + index + config → `~/src/models/engram-src`.
+- `tools/dev/bundle_layout.py` **fixed** (devlog Phase 0 follow-up):
+  qcfg `stored_tensors` entries are keyed by the fully qualified tensor
+  name (`"<module>.trellis"`), not the bare suffix — `module_k()` now
+  mirrors the loader's lookup; `module_dims()` derives in/out from trellis
+  tiles (×16) since qcfg has no `input_features` fields. Canary re-run:
+  K histogram populates (400×K4 + lm_head K6 == `head_bits: 6`),
+  derived-K vs qcfg `bits_per_weight` mismatches: 0.
+- Cloned `PipeNetwork/deepseek-v41-mlx` (12 MB) → `~/src/deepseek-v41-mlx`:
+  port source + parity oracle + torch reference (`docs/reference/`) + the
+  release's full safetensors index (`hub_index.json`).
+- **Source-side key inventory verified** (96,085 tensors): inference-style
+  names, no `model.` prefix (`layers.N.attn.wq_a.weight`, `ffn.experts.N.w1`,
+  `embed/head`) → Phase 3 needs an explicit remap table, see
+  `docs/dsv41_layout_audit.md` §1/§5. DSpark = `mtp.0..2`; vision = 266
+  tensors; engram tables live only in shards 47/48.
+- **Engram hash math verified from config alone:** 24 sequential primes/layer
+  from 16,000,000−1 sum exactly to `engram_num_embeddings`
+  `[384006168, 384016682]` ✔; multipliers odd, from `default_rng(10007·layer)`
+  bounded by `int64max/99092/2`. Compressed-vocab rebuild must equal 99,092
+  (hard error on mismatch — we adopt the same guard).

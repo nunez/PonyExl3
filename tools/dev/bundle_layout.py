@@ -48,16 +48,32 @@ def namespace(key: str) -> str:
     return parts[0] + (".*" if len(parts) > 1 else "")
 
 
-def module_k(info: dict[str, Any]) -> int | None:
+def _trellis_shape(info: dict[str, Any]) -> list[int] | None:
+    """qcfg `stored_tensors` entries are keyed by the *fully qualified*
+    tensor name (`"<module>.trellis"`), not the bare suffix — mirror the
+    loader's lookup in ponyexl3/mlx/model.py."""
     st = info.get("stored_tensors", {})
-    tr = st.get("trellis") or {}
-    shape = tr.get("shape")
-    if not shape or len(shape) != 3:
+    for k, v in st.items():
+        if k == "trellis" or k.endswith(".trellis"):
+            shape = v.get("shape")
+            if shape and len(shape) == 3:
+                return list(shape)
+    return None
+
+
+def module_k(info: dict[str, Any]) -> int | None:
+    shape = _trellis_shape(info)
+    if shape is None:
         return None
     return int(shape[2]) * 16 // 256
 
 
 def module_dims(info: dict[str, Any]) -> tuple[int, int]:
+    """EXL3 module in/out dims. qcfg carries no input_features/output_features
+    fields; trellis tiles are 16x16, so in = in_tiles*16, out = out_tiles*16."""
+    shape = _trellis_shape(info)
+    if shape is not None:
+        return int(shape[0]) * 16, int(shape[1]) * 16
     return int(info.get("input_features", 0)), int(info.get("output_features", 0))
 
 
@@ -89,14 +105,18 @@ def audit(model_dir: Path) -> str:
 
     # -- EXL3 module inventory -------------------------------------------------
     by_ns: dict[str, list[str]] = defaultdict(list)
-    k_hist: dict[int, int] = defaultdict(int)
+    k_hist: dict[tuple[int, Any], int] = defaultdict(int)
+    k_mismatch: list[str] = []
     odd16: list[str] = []
     odd128: list[str] = []
     for key, info in storage.items():
         by_ns[namespace(key)].append(key)
         k = module_k(info)
+        bpw = info.get("bits_per_weight")
         if k is not None:
-            k_hist[k] += 1
+            if bpw is not None and int(bpw) != k:
+                k_mismatch.append(f"{key} (derived K{k} vs qcfg bits {bpw})")
+            k_hist[(k, bpw)] += 1
         ins, outs = module_dims(info)
         if ins % 16 or outs % 16:
             odd16.append(f"{key} ({ins}x{outs})")
@@ -105,9 +125,12 @@ def audit(model_dir: Path) -> str:
     add("\n## EXL3 modules by namespace")
     for ns in sorted(by_ns):
         add(f"- `{ns}`: {len(by_ns[ns])}")
-    add("\n## Per-module K (from trellis shapes)")
-    for k in sorted(k_hist):
-        add(f"- K{k} ({k + 1:.2f} bpw w/ scales): {k_hist[k]} modules")
+    add("\n## Per-module K (derived from trellis tile shapes)")
+    for (k, bpw) in sorted(k_hist, key=lambda t: (t[0], str(t[1]))):
+        add(f"- K{k} (qcfg `bits_per_weight`: {bpw}): {k_hist[(k, bpw)]} modules")
+    add(f"\n- derived-K vs qcfg bits_per_weight mismatches: **{len(k_mismatch)}**")
+    for m in k_mismatch[:20]:
+        add(f"  - {m}")
     add(f"\n- dims not %16 (trellis-invalid): **{len(odd16)}**")
     for m in odd16[:20]:
         add(f"  - {m}")
