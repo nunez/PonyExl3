@@ -71,6 +71,7 @@ macOS. Fork: `nunez/PonyExl3`, base upstream `beamivalice/PonyExl3` @ `8e7fa6b`
 
 ## 2026-10-29 — Phase 1 start: disk, tooling fixes, source-side audit
 
+
 - **Disk:** freed ~1.5 TB (retired `.mtplx`/`.omlx` runtimes, H3 BF16
   weights, kapitsa/copilot caches) → 1.6 TB free on the 4 TB volume.
   Downloads: LibertAI EXL3 pack (~205 GB) → `~/src/models/DeepSeek-V4.1-
@@ -96,3 +97,37 @@ macOS. Fork: `nunez/PonyExl3`, base upstream `beamivalice/PonyExl3` @ `8e7fa6b`
   `[384006168, 384016682]` ✔; multipliers odd, from `default_rng(10007·layer)`
   bounded by `int64max/99092/2`. Compressed-vocab rebuild must equal 99,092
   (hard error on mismatch — we adopt the same guard).
+
+---
+
+## 2026-10-29 — Phase 1 pack-side verification (pack + engram landed)
+
+- Downloads: EXL3 pack **196 GB rc=0** (43 shards) → `~/src/models/DeepSeek-
+  V4.1-Flash-1017-EXL3-2.9bpw`; engram shard 48 + index + config landed;
+  shard 47 re-downloading (first `hf download` call silently dropped one of
+  four explicit filenames — re-invoked per-file).
+- `docs/dsv41_pack_layout.md` generated with the fixed auditor: container
+  **v1.6.2** loads its qcfg natively; **46,702 EXL3 modules**; K histogram
+  {2:5760, 3:40320, 4:57, 5:558, 6:3, 8:4} == `exl3_k_map.json` (80/80 spot
+  checks); **every module's dims %128-clean — Phase 1 tile gate PASSES**.
+- **Container field correction:** the pack's qcfg uses `bits: 2.9`, not
+  `avg_bits` (plan §1 note was wrong — no loader tolerance needed beyond
+  float `bits`).
+- New structural findings:
+  - `wo_a` is quantized as **8 per-o-group slices per layer** (320 modules)
+    — a better answer than PipeNetwork's never-quantize refusal.
+  - Indexers on 8 layers (`wq_b`), `indexer.wk` on 4; `compressor.*`
+    quantized (K5) though PipeNetwork refuses; `engram.wkv` EXL3 (K5/K4);
+    embed plain bf16, head K6 == `head_bits`.
+  - qcfg carries **empty-`stored_tensors` placeholder entries**
+    (`hc_expand`, `layers.N.hc_{attn,ffn}.norm`) — loader must skip.
+  - `mtp.*` bundled **plain** (4839 tensors, 6.88 GiB) despite `mtp_bits: 4`
+    — Phase 6b may need the FP8 dequant path, not EXL3, for DSpark.
+  - Pack shards contain **zero `engram.embed` keys** → tables come from
+    `engram-src` (verified: F8_E4M3 [384M×256] + F8_E8M0 [384M×8], direct
+    mmap possible).
+- `tests/test_dsv41_bundle_layout.py` (env-gated, 10 tests) pins every fact
+  above as regression harness: **9 passed, 1 skipped** (shard 47 pending);
+  full suite 290 passed / 32 skipped.
+- **Phase 1 exit criteria met** (47's header check auto-enables when it
+  lands). Phase 2 (pure-MLX arch) unblocked.

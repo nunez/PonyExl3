@@ -1,16 +1,12 @@
-# deepseek_v41 layout audit (Phase 1)
+# deepseek_v41 layout audit (Phase 1) — PACK VERIFIED 2026-10-29
 
 Source-side facts are **verified** from the release's safetensors index
 (`deepseek-v41-mlx/docs/reference/hub_index.json`, 96,085 tensors,
-510.3 GB `total_size`) and `config.json`. Pack-side sections are pending the
-`LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` download landing in
-`~/src/models/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` — fill in by running:
-
-```
-.venv/bin/python tools/dev/bundle_layout.py \
-    ~/src/models/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw \
-    --out docs/dsv41_pack_layout.md
-```
+510.3 GB `total_size`) and `config.json`. Pack-side facts verified from
+`~/src/models/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` (196 GB, 43 shards,
+rc=0 download); full machine-generated report in
+[`dsv41_pack_layout.md`](dsv41_pack_layout.md), regression harness in
+`tests/test_dsv41_bundle_layout.py` (env-gated).
 
 ## 1. Release (source) key inventory — verified
 
@@ -66,24 +62,45 @@ Table storage: weight = uint8 fp8-e4m3 rows [R, 256]; scale = uint8 ue8m0
 [R, 8] (block 32). Read-only gather → our Phase 3 path is mmap + row gather +
 fp8 dequant kernel, **not** EXL3 (LibertAI keeps them plain too — see §4).
 
-## 4. Expected EXL3 pack layout (to verify on arrival)
+## 4. EXL3 pack layout — VERIFIED
 
-Quantizable set (exl3 `tensor_storage` with `.trellis/.suh/.svh/.mul1/...`
-suffixes), expected counts for the text model:
+Container: `version: 1.6.2`, `bits: 2.9` (top-level field is **`bits`**, not
+`avg_bits` as the plan note said), `codebook: mul1`, `head_bits: 6`,
+`mtp_bits: 4`, `out_scales: always`. `exl3_k_map.json` publishes the K mix
+and matches `tensor_storage` exactly.
 
-- 40 × 5 attention projections (`wq_a,wq_b,wkv,wo_a,wo_b` — unless LibertAI
-  skips `wo_a` like PipeNetwork's never-quantize list)
-- 40 × `indexer.wq_b`, 40 × 3 `shared_experts.w{1,2,3}`
-- 40 × 384 × 3 routed experts = **46,080** expert modules → 160 `EXL3SwitchGLU`
-  stacks (uint16-packed concat sizes: check trellis tile-count overflow at
-  384-deep, out_tiles·384 < 2³² bytes — fine, but validate per §1 memory math)
-- `embed`, `head`, 2 × `engram.wkv`
-- `mtp.*` equivalents if bundled at `mtp_bits: 4` (loader already skips)
+**46,702 EXL3 modules**, derived-K == qcfg `bits_per_weight` on all of them;
+K histogram `{K2: 5760, K3: 40320, K4: 57, K5: 558, K6: 3, K8: 4}`;
+**every module's in/out dims are %128-clean** (the Phase 1 tile gate).
 
-Plain tensors expected: all norms/sinks, `hc_*` (fp32), router
-`gate.{weight,bias,bias_vl}`, `indexer.wk/weights_proj`,
-`compressor.*`, `engram.embed.{weight,scale}` (→ mmap), `engram.q/k_weight`,
-DSML tokenizer assets in `encoding/`, `exl3_k_map.json` (per-module K mix).
+Per-template (×40 layers unless noted):
+
+| Module | K | Notes |
+|---|---|---|
+| `layers.N.ffn.experts.N.w{1,2,3}` (384·3) | 3 (layers 18–22 → 2) | 46,080 modules |
+| `layers.N.ffn.shared_experts.w{1,2,3}` | 5 (11–20 → 4; layer 29 mixed, infer from trellis) | |
+| `attn.wq_a`, `attn.wkv` | 6 | |
+| `attn.wq_b`, `attn.wo_b` | 5 | |
+| **`attn.wo_a.slice.0..7`** | 5 | **LibertAI splits `wo_a` into `o_groups=8` per-group EXL3 slices** — sidesteps PipeNetwork's "block-diagonal reshape carves packed bytes" ban; loader must present the 8 slices as one logical `wo_a` (or run 8 grouped GEMVs) |
+| `indexer.wq_b` (8 layers: 2,8,14,20,24,28,32,36) | 5 | 2-level DSA indexers on every 4th layer |
+| `indexer.wk` (4 layers) | 8 | |
+| `compressor.wkv` (4 layers), `compressor.wgate` (3 layers) | 5 | LibertAI quantizes what PipeNetwork refuses (`compressor.*`); `wgate` absent on 1 layer |
+| `engram.wkv` (layers 1, 14) | 5 / 4 | small projection is EXL3; **embed tables external** (0 `engram.embed` keys in-pack) |
+| `head` | 6 | == `head_bits`; `embed` plain bf16 (1.23 GiB) |
+
+Plain tensors (9.31 GiB total, shard-header scan): norms/sinks/`hc_*_{base,
+fn,scale}`/router `gate.{weight,bias,bias_vl}`/`indexer.k_norm`/
+`compressor.norm`/`embed`/`norm` + `mtp.*` 4839 tensors (6.88 GiB, plain —
+loader skips) + `vision.*`/`aligner.*`/`image_*` (~0.9 GiB, skipped).
+Quirk: qcfg also carries **empty `stored_tensors: {}` placeholders**
+(`hc_expand`, `layers.N.hc_{attn,ffn}.norm`) that have no shard tensors —
+loader must tolerate entries with no stored data.
+
+**Engram source tables** (`~/src/models/engram-src` = release shards
+47/48): `embed.weight` `F8_E4M3` [384,016,682 × 256] + `embed.scale`
+`F8_E8M0` [384,016,682 × 8] (block 32) — native FP8 dtypes in safetensors,
+direct `mmap` byte access works; `q/k_weight` bf16 [4, 5120]; `wkv` fp8
+(we use the pack's EXL3 `engram.wkv` instead).
 
 ## 5. Loader gaps to close in Phase 3
 
@@ -97,9 +114,12 @@ DSML tokenizer assets in `encoding/`, `exl3_k_map.json` (per-module K mix).
    `mlp.experts.…gate_proj`).
 3. Expert stacking names `w1/w2/w3` → `EXL3SwitchGLU` gate/up/down order =
    `w1/w3/w2` mapping (reference converter: w1=gate, w3=up, w2=down).
-4. qcfg tolerations: `avg_bits` (not `bits`), `mtp_bits`, version `1.6.2`,
-   `out_scales: always` — small loader patch.
-5. Engram tables: keep plain uint8/uint8, `np.memmap` → device gather; never
+4. qcfg tolerations: version `1.6.2`, top-level `bits` (float 2.9 — the plan's
+   `avg_bits` note was wrong), `mtp_bits`, `out_scales: always`; and entries
+   with **empty `stored_tensors`** (`hc_expand`, `hc_*.norm`) must be ignored.
+5. `wo_a` arrives as `attn.wo_a.slice.{0..7}` EXL3 modules — build as 8
+   EXL3Linears (one per o-group) or fuse into one logical projection.
+6. Engram tables: keep plain uint8/uint8, `np.memmap` → device gather; never
    build host fp16 copies (Phase 4 policy).
 
 ## 6. Memory math (M3 Ultra 512 GB)

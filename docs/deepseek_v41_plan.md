@@ -31,9 +31,10 @@ ports (`deepseek-v41-mlx`, gbx-lm, oMLX). `mlx-lm` itself still lacks the arch
 - `model_type: deepseek_v41`, text `deepseek_v41_text`, arch
   `DeepseekV41ForCausalLM`; `vision_config` present (DeepSeek-ViT); text-only
   runtime drops it.
-- EXL3 container **v1.6.2**, `codebook: mul1`, `avg_bits: 2.9` (note:
-  `avg_bits`, not `bits` — PonyExl3 must tolerate this), `head_bits: 6`,
-  `mtp_bits: 4` (DSpark/MTP head bundled), `out_scales: always`.
+- EXL3 container **v1.6.2**, `codebook: mul1`, `bits: 2.9` (verified pack
+  qcfg uses `bits` — the earlier `avg_bits` note was wrong), `head_bits: 6`,
+  `mtp_bits: 4` (DSpark/MTP head bundled **plain**, not EXL3), `out_scales:
+  always`.
 - `exl3_k_map.json` (1.4 KB) publishes the per-module K mix;
   `quantization_config.json` is a 54 MB per-module storage map. PonyExl3's
   loader already derives K per module from trellis shapes → mixed-bitrate
@@ -84,32 +85,32 @@ ports (`deepseek-v41-mlx`, gbx-lm, oMLX). `mlx-lm` itself still lacks the arch
 
 ## 2. Phases
 
-### Phase 0 — green baseline + modern-container gate (D0–D1)
-- [ ] `uv venv --python 3.14` (system py3.15 may lack mlx wheels), `pip install -e ".[dev]"`.
-- [ ] `pytest tests/ -q` → 293 green on M3 Ultra (records our baseline vs upstream `v0.3.0`).
-- [ ] Download `turboderp/Qwen3.8-27B-exl3` rev `4.00bpw` (~15 GB; container **v1.4.2**, `mul1`, `mtp_bits: 4`).
-- [ ] `ponyexl3-generate … --mtp auto` smoke; then `--mtp off` parity check vs plain greedy.
+### Phase 0 — green baseline + modern-container gate (D0–D1) ✅ GO 2026-10-29
+- [x] `uv venv --python 3.14` + `pip install -e ".[dev]"` (mlx 0.31.2 pinned).
+- [x] `pytest tests/ -q` → **290 passed, 22 skipped** on M3 Ultra.
+- [x] `turboderp/Qwen3.8-27B-exl3` rev `4.00bpw` (container v1.4.2) downloaded.
+- [x] `--mtp off` coherent (14.2 tok/s); `--mtp auto` verify-gated (16.7 tok/s).
 - **GO gate:** container ≥ v1.4 loads and generates correctly → the v1.6.2 DS pack has
   a realistic chance. NO-GO → the loader-vs-1.4.x diff becomes the first project.
 - Log: `docs/dsv41_devlog.md` starts here (every phase appends).
 
-### Phase 1 — container + layout audit of the DS pack (D1–D3)
-- [ ] Download LibertAI pack (~205 GB) + `engram-src` (DeepSeek Engram shards, ~189 GB).
-- [ ] Tool `tools/dev/dsv41_layout.py`: dump `quantization_config.json` storage schema
-      + `exl3_k_map.json`; diff module keys against what `_module_path()` /
-      `_is_exl3_linear_key()`-style paths would expect (`model.layers.N.…` vs Qwen's
-      `model.language_model.layers.N.…`; expert naming `…experts.<i>.…`;
-      indexer/compressor/mHC keys; `mtp.*`; `visual.*`).
-- [ ] Verify tile constraints on every quantized module: in/out multiples of 16
-      (and HAD_DIM 128 where Hadamard applies) — flag odd dims early
-      (`q_lora_rank 1280`, `o_lora_rank 1024`, indexer dims, `moe_intermediate 2304`, etc.).
-- [ ] Audit Engram dir format: safetensors layout, dtypes (FP8), hash/n-gram encoding
-      (cross-read PipeNetwork `docs/reference/engram.py` + `encoding/` in the pack).
-- [ ] Identify every non-EXL3 tensor the bundle carries plain (norms, routers,
-      `A_log`-style, dt_bias, embeddings, hc params).
-- **Deliverables:** `docs/dsv41_layout_audit.md` (key inventory + gaps list +
-  memory math) and an env-gated `tests/test_dsv41_bundle_layout.py` that
-  asserts the audit facts (runs only with `PONYEXL3_MODEL_DSV41` set).
+### Phase 1 — container + layout audit of the DS pack (D1–D3) ✅ DONE 2026-10-29
+- [x] Download LibertAI pack (196 GB, landed) + `engram-src` (Engram shards
+      47/48; 48 landed, 47 in flight).
+- [x] Tool: `tools/dev/bundle_layout.py` (shard-header-only auditor; K/dims
+      fixed for the real qcfg schema) + pack run → `docs/dsv41_pack_layout.md`.
+      (Replaces `dsv41_layout.py`; key diffs documented in audit §1/§5.)
+- [x] Tile constraints: **all 46,702 EXL3 modules in/out %128-clean** — the
+      "flag odd dims early" gate passes outright.
+- [x] Engram dir format: F8_E4M3 [384,016,682×256] + F8_E8M0 [×8] tables in
+      shards 47/48; prime-bucket layout verified from config; compressed
+      vocab must rebuild to 99,092 (hard-error guard adopted).
+- [x] Plain inventory: 9.31 GiB total (norms/sinks/hc/routers/embed +
+      **plain `mtp.*` 6.88 GiB** + vision 0.9 GiB); qcfg carries
+      empty-`stored_tensors` placeholders the loader must skip.
+- **Deliverables:** `docs/dsv41_layout_audit.md` ✅,
+  `tests/test_dsv41_bundle_layout.py` (env-gated, `PONYEXL3_MODEL_DSV41` /
+  `PONYEXL3_ENGRAM_DIR`) ✅
 
 ### Phase 2 — pure-MLX `deepseek_v41` text architecture (D3–D10)
 No EXL3 yet; fp16/fakequant, so everything is testable without the 400 GB on disk.
