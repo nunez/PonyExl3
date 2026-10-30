@@ -317,6 +317,30 @@ def _ensure_token_map(model_dir: str, args: ModelArgs, verbose: bool) -> list[in
     return lookup
 
 
+def _apply_wired_limit() -> None:
+    """Keep device buffers RESIDENT. macOS 27 pages GPU memory on demand and
+    mlx's wired limit defaults to 0 — a 190 GB model touched in scattered
+    expert-tile reads faults pages every decode step (measured ~45x decode
+    slowdown vs. resident). ``DSV41_WIRED_GB`` overrides (0 disables);
+    default pins just under the IOGPU wired ceiling."""
+    env = os.environ.get("DSV41_WIRED_GB", "").strip()
+    try:
+        if env:
+            gb = float(env)
+            if gb <= 0:
+                return
+            lim = int(gb * 1024**3)
+        else:
+            info = mx.device_info()
+            ws = int(info.get("max_recommended_working_set_size", 0))
+            if ws <= 0:
+                return
+            lim = int(ws * 0.92)
+        mx.set_wired_limit(lim)
+    except Exception:
+        pass  # pre-macOS-15 or unsupported knob: pageable anyway, still correct
+
+
 def load_dsv41_model(
     model_dir: str,
     *,
@@ -329,6 +353,7 @@ def load_dsv41_model(
     load_engram: bool = True,
 ) -> tuple[DeepseekV41ForPony, dict[str, Any]]:
     _apply_device_memory_limit()
+    _apply_wired_limit()
     with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
         config = json.load(f)
     with open(os.path.join(model_dir, "quantization_config.json"), encoding="utf-8") as f:
