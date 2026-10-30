@@ -50,6 +50,29 @@ def window_idx_matrix(wp: int, n: int, window: int) -> mx.array:
     return mx.where(idx > end[:, None], mx.array(-1, mx.int32), idx.astype(mx.int32))
 
 
+class WoAGrouped(nn.Module):
+    """Grouped block-diagonal ``wo_a`` as ``o_groups`` separate EXL3 linears.
+
+    The EXL3 pack stores ``wo_a`` pre-split along the group axis
+    (``attn.wo_a.slice.0..7``, one module per o-group — LibertAI's answer to
+    the fact that a quantized ``.weight`` cannot be block-reshaped). Each
+    slice is an EXL3-compatible linear ``[n_heads/g*head_dim -> o_lora_rank]``;
+    called on ``o`` shaped [b, s, g, d_in] this returns [b, s, g*o_lora_rank]
+    in the same layout the einsum over the reshaped dense weight produces.
+    """
+
+    _dsv41_sliced = True
+
+    def __init__(self, slices: list[nn.Module]):
+        super().__init__()
+        self.slices = list(slices)
+
+    def __call__(self, o: mx.array) -> mx.array:
+        return mx.concatenate(
+            [sl(o[:, :, g, :]) for g, sl in enumerate(self.slices)], axis=-1
+        )
+
+
 class Attention(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -174,9 +197,15 @@ class Attention(nn.Module):
         if not self._break_rope_inverse:
             o = rope_tail(o, rd, c_q, s_q, inverse=True)
         o = o.reshape(bsz, n, self.n_groups, -1)
-        wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
-        o = mx.einsum("bsgd,grd->bsgr", o.astype(mx.float32), wo_a.astype(mx.float32))
-        return self.wo_b(o.reshape(bsz, n, -1).astype(x.dtype))
+        if getattr(self.wo_a, "_dsv41_sliced", False):
+            # EXL3 path: o_groups per-group quantized slices (WoAGrouped)
+            o = self.wo_a(o).astype(x.dtype)
+        else:
+            wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
+            o = mx.einsum("bsgd,grd->bsgr", o.astype(mx.float32),
+                          wo_a.astype(mx.float32))
+            o = o.reshape(bsz, n, -1).astype(x.dtype)
+        return self.wo_b(o)
 
 # Ported from PipeNetwork/deepseek-v41-mlx (MIT, (c) PipeNetwork contributors);
 # transcribed from the DeepSeek torch reference. Kept name-for-name so the

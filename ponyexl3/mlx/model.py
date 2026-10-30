@@ -588,6 +588,15 @@ def load_model(
         raise ValueError(f"{model_dir} is not an EXL3 checkpoint")
 
     model_type = config["model_type"]
+    if model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # local architecture (no mlx_lm module yet) + external engram tables
+        from ponyexl3.mlx.dsv41_loader import load_dsv41_model
+
+        return load_dsv41_model(
+            model_dir, engine=engine, warm=warm, verbose=verbose,
+            group_size=group_size, report_errors=report_errors,
+            engram_dir=os.environ.get("PONYEXL3_ENGRAM_DIR") or None,
+        )
     arch_name = _ARCHITECTURES.get(model_type)
     if arch_name is None:
         raise ValueError(f"no architecture mapping for model_type={model_type!r}")

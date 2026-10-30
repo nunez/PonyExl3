@@ -59,8 +59,16 @@ _MM_MAX_ROWS = int(os.environ.get("EXL3_MM_MAX_ROWS", str(9 * 1024)))
 _MOE_ACTIVATIONS = frozenset({"silu", "gelu"})
 
 
-def _moe_glu_metal_expr(act: str) -> str:
-    """Metal expression: gate ``g``, value ``u`` -> activated hidden."""
+def _moe_glu_metal_expr(act: str, clamp: float = 0.0) -> str:
+    """Metal expression: gate ``g``, value ``u`` -> activated hidden.
+    ``clamp > 0`` applies the DeepSeek-V4.1 clamped SwiGLU: ``u`` clamped
+    two-sided, ``g`` upper-only, before silu (matches layers.clamped_swiglu)."""
+    if clamp > 0 and act != "gelu":
+        return (
+            f"float gc = fmin(g, {clamp:.6f}f);\n"
+            f"        float uc = fmin(fmax(u, {-clamp:.6f}f), {clamp:.6f}f);\n"
+            "        float h = (gc / (1.0f + exp(-gc))) * uc;"
+        )
     if act == "gelu":
         return (
             "float tanh_arg = 0.797884560803f * (g + 0.044715f * g * g * g);\n"
@@ -69,7 +77,10 @@ def _moe_glu_metal_expr(act: str) -> str:
     return "float h = (g / (1.0f + exp(-g))) * u;"
 
 
-def _moe_gate_activation(g: mx.array, u: mx.array, act: str) -> mx.array:
+def _moe_gate_activation(g: mx.array, u: mx.array, act: str, clamp: float = 0.0) -> mx.array:
+    if clamp > 0 and act != "gelu":
+        g = mx.minimum(g, mx.array(clamp, g.dtype))
+        u = mx.clip(u, -clamp, clamp)
     if act == "gelu":
         return nn.gelu_approx(g) * u
     return nn.silu(g) * u
@@ -263,11 +274,11 @@ def _lane_setup() -> str:
 """
 
 
-def _moe_gateup_source(k: int, cb: CodebookMode, act: str = "silu") -> str:
+def _moe_gateup_source(k: int, cb: CodebookMode, act: str = "silu", clamp: float = 0.0) -> str:
     """Kernel A: gate+up GEMV pair + dual-block post-Hadamard + svh + GLU,
     one dispatch for ALL selected experts. Threadgroup owns a (gate-block,
     up-block) pair: 128 hidden cols of one expert."""
-    glu = _moe_glu_metal_expr(act)
+    glu = _moe_glu_metal_expr(act, clamp)
     decode = __import__("ponyexl3.mlx.gemv_metal", fromlist=["_decode_expr"])._decode_expr(cb, cw_in="cw")
     return f"""
 #define PACKED_U32 {k * 256 // 32}
@@ -371,12 +382,12 @@ def _moe_gateup2_source(k: int, cb: CodebookMode) -> str:
 """
 
 
-def _moe_down2_source(k: int, cb: CodebookMode, act: str = "silu") -> str:
+def _moe_down2_source(k: int, cb: CodebookMode, act: str = "silu", clamp: float = 0.0) -> str:
     """Kernel B2: down projection whose prologue FINISHES gate+up (dual
     butterfly + svh + GLU) from kernel A2's raw output, then pre-rotates
     and runs the down tile loop. Each of the slot's threadgroups redoes the
     ~2 KB prologue — trivial ALU for the occupancy freedom it buys."""
-    glu = _moe_glu_metal_expr(act)
+    glu = _moe_glu_metal_expr(act, clamp)
     decode = __import__("ponyexl3.mlx.gemv_metal", fromlist=["_decode_expr"])._decode_expr(cb, cw_in="cw")
     return f"""
 #define PACKED_U32 {k * 256 // 32}
@@ -437,10 +448,13 @@ class EXL3SwitchGLU(nn.Module):
         k: int,
         cb: CodebookMode,
         activation: str = "silu",
+        swiglu_limit: float = 0.0,
     ):
         super().__init__()
         if activation not in _MOE_ACTIVATIONS:
             raise ValueError(f"unsupported MoE activation {activation!r}")
+        if swiglu_limit > 0 and activation == "gelu":
+            raise ValueError("swiglu_limit applies to silu activations only")
         self._gu_trellis = gu_trellis
         self._gu_suh = gu_suh
         self._gu_svh = gu_svh
@@ -450,6 +464,7 @@ class EXL3SwitchGLU(nn.Module):
         self._k = k
         self._cb = cb
         self._activation = activation
+        self._clamp = float(swiglu_limit)
         self.num_experts = int(gu_suh.shape[0])
         self.input_dims = int(gu_suh.shape[2])
         self.hidden_dims = int(dn_suh.shape[1])
@@ -457,15 +472,16 @@ class EXL3SwitchGLU(nn.Module):
         self._dn_tiles = self.input_dims // 16
 
     def _kernels(self) -> tuple[Callable[..., Any], Callable[..., Any]]:
-        key = (self._k, int(self._cb), self._activation, "v1")
+        key = (self._k, int(self._cb), self._activation, self._clamp, "v1")
         pair = _MOE_KERNELS.get(key)
         if pair is None:
             act = self._activation
+            tag = act + (f"c{self._clamp:g}" if self._clamp else "")
             kA = mx.fast.metal_kernel(
-                name=f"exl3_moe_gateup_k{self._k}_cb{int(self._cb)}_{act}_v1",
+                name=f"exl3_moe_gateup_k{self._k}_cb{int(self._cb)}_{tag}_v1",
                 input_names=["xh", "trellis", "perm", "sel", "gu_svh", "dims"],
                 output_names=["out"],
-                source=_moe_gateup_source(self._k, self._cb, act),
+                source=_moe_gateup_source(self._k, self._cb, act, self._clamp),
             )
             kB = mx.fast.metal_kernel(
                 name=f"exl3_moe_down_k{self._k}_cb{int(self._cb)}_{act}_v1",
@@ -549,24 +565,25 @@ class EXL3SwitchGLU(nn.Module):
         return y.reshape(E_sel, D)
 
     def _kernels2(self):
-        key = (self._k, int(self._cb), self._activation, "v2")
+        key = (self._k, int(self._cb), self._activation, self._clamp, "v2")
         pair = _MOE_KERNELS.get(key)
         if pair is None:
             act = self._activation
+            tag = act + (f"c{self._clamp:g}" if self._clamp else "")
             kA = mx.fast.metal_kernel(
-                name=f"exl3_moe_gateup2_k{self._k}_cb{int(self._cb)}_{act}_v2",
+                name=f"exl3_moe_gateup2_k{self._k}_cb{int(self._cb)}_{tag}_v2",
                 input_names=["xh", "trellis", "perm", "sel", "dims"],
                 output_names=["out"],
                 source=_moe_gateup2_source(self._k, self._cb),
             )
             kB = mx.fast.metal_kernel(
-                name=f"exl3_moe_down2_k{self._k}_cb{int(self._cb)}_{act}_v2",
+                name=f"exl3_moe_down2_k{self._k}_cb{int(self._cb)}_{tag}_v2",
                 input_names=[
                     "ygu", "trellis", "perm", "sel",
                     "gu_svh", "dn_suh", "dn_svh", "dims",
                 ],
                 output_names=["out"],
-                source=_moe_down2_source(self._k, self._cb, act),
+                source=_moe_down2_source(self._k, self._cb, act, self._clamp),
             )
             pair = _MOE_KERNELS[key] = (kA, kB)
         return pair
@@ -668,7 +685,7 @@ class EXL3SwitchGLU(nn.Module):
         ).reshape(E_sel, 2 * self.hidden_dims)
         y = _rows_finish()(y.astype(mx.float16), self._gu_svh[sel])
         g, u = mx.split(y, 2, axis=-1)
-        h = _moe_gate_activation(g, u, self._activation)
+        h = _moe_gate_activation(g, u, self._activation, self._clamp)
 
         ar_dn = mx.arange(self._dn_tiles, dtype=mx.uint32)
         tile_map = (
@@ -746,7 +763,7 @@ class EXL3SwitchGLU(nn.Module):
             )
         g = _rows_finish()(g.reshape(N, H).astype(mx.float16), self._gu_svh[sidx, :H])
         u = _rows_finish()(u.reshape(N, H).astype(mx.float16), self._gu_svh[sidx, H:])
-        h = _moe_gate_activation(g, u, self._activation)
+        h = _moe_gate_activation(g, u, self._activation, self._clamp)
 
         if use_mm:
             h_pad = mx.concatenate([h, mx.zeros((_SEG_BM, H), dtype=h.dtype)])
@@ -768,6 +785,18 @@ class EXL3SwitchGLU(nn.Module):
         return y[inv].reshape(B, S, kk, D)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        """SwitchGLU-compatible. Accepts the 3-D convention ``x (B, S, D)`` +
+        ``indices (B, S, k)`` (Qwen blocks) or the flattened 2-D convention
+        ``x (tokens, D)`` + ``indices (tokens, k)`` (deepseek_v41 MoE, which
+        reshapes to tokens before routing like the DeepSeek reference)."""
+        if indices.ndim == 2:
+            y = self._call_3d(
+                x.reshape(1, -1, x.shape[-1]), indices.reshape(1, *indices.shape)
+            )
+            return y.reshape(indices.shape[0], indices.shape[1], -1)
+        return self._call_3d(x, indices)
+
+    def _call_3d(self, x: mx.array, indices: mx.array) -> mx.array:
         B, S, kk = indices.shape
         R = B * S
         if R == 1:

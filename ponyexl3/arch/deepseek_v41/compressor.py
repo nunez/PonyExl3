@@ -57,8 +57,20 @@ class Compressor(nn.Module):
 
         bsz, n, _ = x.shape
         xf = x.astype(mx.float32)
-        kv = xf @ self.wkv.weight.astype(mx.float32).T
-        score = xf @ self.wgate.weight.astype(mx.float32).T
+        w = getattr(self.wkv, "weight", None)
+        manual = (
+            w is not None
+            and w.dtype in (mx.float32, mx.float16, mx.bfloat16)
+            and not hasattr(self.wkv, "_exl3_engine")
+        )
+        if manual:
+            # parity path (dense fp weights): fp32 matmul, as the reference
+            kv = xf @ self.wkv.weight.astype(mx.float32).T
+            score = xf @ self.wgate.weight.astype(mx.float32).T
+        else:
+            # quantized engine (EXL3Linear / affine): fp16 internals
+            kv = self.wkv(xf).astype(mx.float32)
+            score = self.wgate(xf).astype(mx.float32)
 
         m = start_pos % ratio                    # carried tokens of the open group
         if m:

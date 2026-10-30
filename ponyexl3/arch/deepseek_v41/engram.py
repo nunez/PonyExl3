@@ -186,6 +186,11 @@ class EngramEmbedding(nn.Module):
     ``weight`` uint8 [rows, d] (fp8 e4m3 bytes) + ``scale`` uint8 [rows, d//32]
     (ue8m0) for the real checkpoint; float ``weight``/``scale`` (fp8 values and
     power-of-two scales as floats) for tests.
+
+    For the 190 GB release tables, :meth:`set_host_tables` keeps the bytes in
+    host mmaps instead: a lookup touches ~1 KB of rows (n-gram hashed ids,
+    4 cols × 256 B), so CPU-side gather + per-lookup upload beats 190 GB of
+    device-resident memory that competes with the pack for the working set.
     """
 
     def __init__(self, num_embeddings: int, dim: int, block: int = 32):
@@ -193,8 +198,28 @@ class EngramEmbedding(nn.Module):
         self.block = block
         self.weight = mx.zeros((num_embeddings, dim), dtype=mx.uint8)
         self.scale = mx.ones((num_embeddings, dim // block), dtype=mx.uint8)
+        self._host_w: np.ndarray | None = None
+        self._host_s: np.ndarray | None = None
+
+    def set_host_tables(self, weight: np.ndarray, scale: np.ndarray) -> None:
+        """Attach host-resident uint8 tables (mmap views); lookups gather on
+        the CPU and upload only the touched rows."""
+        assert weight.dtype == np.uint8 and scale.dtype == np.uint8
+        assert weight.shape[0] == scale.shape[0]
+        self._host_w, self._host_s = weight, scale
+        # release the placeholder (lazy 384M-row zeros would otherwise
+        # materialize at the next parameters() eval)
+        self.weight = mx.zeros((1, weight.shape[1]), dtype=mx.uint8)
+        self.scale = mx.zeros((1, scale.shape[1]), dtype=mx.uint8)
 
     def __call__(self, indices: mx.array) -> mx.array:
+        if self._host_w is not None:
+            idx = np.asarray(indices).reshape(-1).astype(np.int64)
+            w = np.ascontiguousarray(self._host_w[idx])
+            s = np.ascontiguousarray(self._host_s[idx])
+            v = mx.array(w).reshape(*indices.shape, -1)
+            sc = mx.array(s).reshape(*indices.shape, -1)
+            return dequant_fp8_rows(v, sc, self.block)
         v = self.weight[indices]                                 # [..., d]
         s = self.scale[indices]                                  # [..., d//block]
         if self.weight.dtype == mx.uint8:

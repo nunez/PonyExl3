@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 
 REF = Path(os.environ.get("PONYEXL3_DSV41_MLX", "~/src/deepseek-v41-mlx")).expanduser()
 pytestmark = pytest.mark.skipif(
@@ -206,6 +207,70 @@ def test_engram_hasher_parity() -> None:
     assert np.array_equal(a2, b2) and np.array_equal(ca, cb)
     # rows must stay inside the declared table
     assert a.max() < max(CFG["engram_num_embeddings"])
+
+
+def test_wo_a_sliced_equals_dense_einsum() -> None:
+    """WoAGrouped (per-slice linears) must reproduce the einsum over the
+    reshaped dense wo_a exactly — this is what Phase 3 relies on."""
+    from ponyexl3.arch.deepseek_v41.attention import WoAGrouped
+    g, r, d, bsz, n = 4, 16, 64, 2, 5   # groups, o_lora_rank, per-group in
+    rng = np.random.default_rng(41)
+    w = rng.normal(0, 1, (g * r, d)).astype(np.float32)   # dense wo_a weight
+    x = rng.normal(0, 1, (bsz, n, g * d)).astype(np.float32)
+    dense = mx.einsum("bsgd,grd->bsgr",
+                      mx.array(x).reshape(bsz, n, g, d),
+                      mx.array(w).reshape(g, r, d))
+    dense = dense.reshape(bsz, n, -1)
+    sliced = WoAGrouped([nn.Linear(d, r, bias=False) for _ in range(g)])
+    for gi in range(g):
+        sliced.slices[gi].weight = mx.array(w[gi * r:(gi + 1) * r])
+    got = sliced(mx.array(x).reshape(bsz, n, g, d))
+    assert mx.max(mx.abs(got - dense)).item() < 1e-5
+
+
+def test_moe_clamped_swiglu_matches_arch() -> None:
+    """exl3_moe's Python fallback must equal arch layers.clamped_swiglu, and
+    the Metal expression must carry the same clamp constants."""
+    from mlx.nn import silu
+
+    from ponyexl3.arch.deepseek_v41.layers import clamped_swiglu
+    from ponyexl3.mlx.exl3_moe import _moe_gate_activation, _moe_glu_metal_expr
+
+    rng = np.random.default_rng(42)
+    g = mx.array(rng.normal(0, 8, (3, 16)).astype(np.float32))
+    u = mx.array(rng.normal(0, 8, (3, 16)).astype(np.float32))
+    limit = 10.0
+    ref = clamped_swiglu(g, u, limit)
+    got = _moe_gate_activation(g, u, "silu", limit).astype(mx.float32)
+    assert mx.max(mx.abs(ref - got)).item() < 1e-4
+    expr = _moe_glu_metal_expr("silu", limit)
+    assert "fmin(g, 10.000000f)" in expr and "fmax(u, -10.000000f)" in expr
+    # no clamp → untouched silu*up
+    assert _moe_glu_metal_expr("silu", 0.0) == \
+        "float h = (g / (1.0f + exp(-g))) * u;"
+    assert mx.max(mx.abs(_moe_gate_activation(g, u, "silu", 0.0).astype(mx.float32)
+                         - (silu(g) * u))).item() == 0.0
+
+
+def test_engram_host_tables_equal_device() -> None:
+    """Host-mmap mode must dequantize identical rows to device-resident mode."""
+    from ponyexl3.arch.deepseek_v41.engram import EngramEmbedding
+
+    rng = np.random.default_rng(43)
+    rows, dim, block = 997, 256, 32
+    w = rng.integers(0, 256, (rows, dim), dtype=np.uint8)
+    s = rng.integers(118, 128, (rows, dim // block), dtype=np.uint8)  # ~2^0..2^7
+    idx = rng.integers(0, rows, (3, 5))
+
+    emb = EngramEmbedding(rows, dim, block)
+    emb.weight = mx.array(w)
+    emb.scale = mx.array(s)
+    dev = emb(mx.array(idx))
+
+    emb2 = EngramEmbedding(rows, dim, block)
+    emb2.set_host_tables(w, s)
+    got = emb2(mx.array(idx))
+    assert mx.max(mx.abs(dev - got)).item() == 0.0
 
 
 def test_generate_loop_integration() -> None:

@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+    "ml-dtypes>=0.6.0",
     "mlx>=0.31.2",
     "mlx-lm>=0.31.3",
     "numpy>=2.0",

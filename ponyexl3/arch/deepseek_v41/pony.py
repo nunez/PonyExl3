@@ -33,7 +33,30 @@ class DeepseekV41ForPony:
         self._m = model
         self.model = _InnerModel(model)
         self.lm_head = model.head
+        # mlx_lm convention: generate/compare tools reach for
+        # ``model.language_model`` before ``.model``/``.lm_head``
+        self.language_model = self
 
     def make_cache(self, bsz: int = 1, max_seq_len: int | None = None,
                    dtype=mx.float32):
         return self._m.make_cache(bsz, max_seq_len, dtype)
+
+    # --- delegate the usual mlx_lm model surface to the wrapped Model ---
+    def parameters(self):
+        return self._m.parameters()
+
+    def named_modules(self):
+        return self._m.named_modules()
+
+    def eval(self):
+        self._m.eval()
+        return self
+
+    @property
+    def layers(self):
+        return self._m.layers
+
+    def __getattr__(self, name: str):
+        if name == "_m":
+            raise AttributeError(name)
+        return getattr(self._m, name)

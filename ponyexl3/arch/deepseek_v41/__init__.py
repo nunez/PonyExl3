@@ -10,7 +10,8 @@ This package has no ``mlx_lm`` architecture dependency (mlx-lm has no
 ``deepseek_v41`` module yet — ml-explore/mlx-lm#1233).
 """
 
+from ponyexl3.arch.deepseek_v41.attention import WoAGrouped
 from ponyexl3.arch.deepseek_v41.config import ModelArgs
 from ponyexl3.arch.deepseek_v41.model import Model
 
-__all__ = ["ModelArgs", "Model"]
+__all__ = ["ModelArgs", "Model", "WoAGrouped"]
